@@ -1,0 +1,453 @@
+---
+title: "2023 Cy Young Predictions"
+author: "Jonah Bonesteel"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width = 6.7, fig.height = 4)
+```
+
+Read in libraries
+
+```{r}
+library(readr)
+library(ggplot2)
+library(dplyr)
+library(mgcv)
+library(earth)
+library(corrplot)
+library(randomForest)
+library(xgboost)
+library(nnet)
+library(NeuralNetTools)
+library(caret)
+```
+
+Read in data
+
+```{r}
+cy_data <- read_csv("new_cy_data.csv")
+#View(cy_data)
+colnames(cy_data)[colnames(cy_data) == 'Vote Pts'] <- 'VotePts'
+
+```
+
+First, lets remove some irrelevant variables and check data types.
+
+```{r}
+
+cy_data_subset <- cy_data %>%
+  select(-Rank, -Name, -Tm, -`Name-additional`,-Rank,-Share, -`1st Place`, -`W-L%`)
+
+cy_data_subset <- head(cy_data_subset, -2)
+sapply(cy_data_subset, class)
+
+
+```
+
+Lets take a look at summary statistics and a basic correlation matrix for a few of the numeric variables to see if there are any patterns.
+
+Will not spend extensive time on EDA since this had already been done prior.
+
+```{r}
+summary(cy_data_subset)
+
+matrix<-cor(cy_data_subset)
+head(round(matrix,2))
+
+#corrplot(matrix, method="number", title="Correlation Matrix", mar=c(0,0,1,0), number.cex=0.70)
+```
+
+
+I have a hunch that the Cy Young criteria for starters is different than for relievers. Lets look at some variables that would differ the most between starters and relievers, such as innings pitched and saves.
+
+```{r}
+boxplot(cy_data_subset$IP, main="Boxplot of Innings Pitched", ylab="Innings Pitched")
+ggplot(cy_data_subset, aes(IP)) + geom_histogram(aes(fill = VotePts), binwidth = 20) + ggtitle('Innings Pitched versus Vote Count')
+ggplot(cy_data_subset, aes(SV)) + geom_histogram(aes(fill = VotePts), binwidth = 6) + ggtitle('Saves versus Vote Count')
+```
+
+There does appear to be a clear divide among starters and relievers. The plot of innings pitched vs points shows there to be a bimodal distribution, where there is a large cluster of data points around the 75 to 100 innings pitched range as well as one around the 200 to 250 innings pitched range. This would make sense to explain starters vs relievers. Relievers would tend to be in the 75-100 innings pitched range, while starters would tend to be 150 innings pitched and above. Additionally, the plots surrounding the saves variable show us the clear divide between who are starters and who are relievers, as it is extremely rare that a starter records a save. However, there are relievers who do not earn saves.
+
+A solution to this problem would be to use the 'games started' and 'games appeared' columns. A reliever ought to be classified as someone who is making lots of game appearances but having few starting appearances. Lets create a "games started rate" column where it is simply = games started / total games.
+
+```{r}
+cy_data_subset <- mutate(cy_data_subset, start_rate = GS/G)
+```
+
+Define a reliever as someone with a start rate of lower than 25%.
+
+```{r}
+cy_data_subset$position <- ifelse(cy_data_subset$start_rate < 0.25, 'Reliever', 'Starter')
+```
+
+Plot count of starters vs relievers in the data set.
+
+```{r}
+ggplot(data = cy_data_subset, aes(x = position)) +
+    geom_bar() + ggtitle('Count of Relievers and Starters')
+```
+
+Training / validation split to compare models against each other
+
+```{r}
+# remove relievers from this model
+cy_data_subset <- cy_data_subset[cy_data_subset$position != "Reliever", ]
+
+# remove reliever columns
+cy_data_subset <- cy_data_subset %>%
+  select(-start_rate, -position, -SV, -GS, -GF, -IBB, -BK, `ERA+`)
+
+
+
+set.seed(123)
+# Generate random indices for train and validation sets
+indices <- sample(1:nrow(cy_data_subset), size = round(0.8 * nrow(cy_data_subset)), replace = FALSE)
+
+# Create training and validation sets
+train <- cy_data_subset[indices, ]
+validation <- cy_data_subset[-indices, ]
+train <- train[, -ncol(train)]
+validation <- validation[, -ncol(validation)]
+# remove era+
+
+```
+
+Model 1: MARS
+
+```{r}
+# create
+mars1 <- earth(VotePts ~ ., data = train)
+summary(mars1)
+ 
+# predict on validation data
+predictions <- predict(mars1, newdata = validation, response = "VotePts")
+mars_mse <- mean((validation$VotePts - predictions)^2)
+
+# Calculate the Root Mean Squared Error (RMSE)
+mars_rmse <- sqrt(mars_mse)
+print(mars_rmse)
+```
+
+MARS RMSE: 33.14738
+
+Model 2: Poisson Regression
+
+```{r}
+
+poisson_model <- glm(VotePts ~ ., data = train, family = poisson)
+# predict on validation data
+pois_predictions <- predict(poisson_model, newdata = validation, response = "VotePts")
+poisson_mse <- mean((validation$VotePts - pois_predictions)^2)
+
+# Calculate the Root Mean Squared Error (RMSE)
+poisson_rmse <- sqrt(poisson_mse)
+print(poisson_rmse)
+
+```
+
+Poisson RMSE: 59.72489
+
+
+Model 3: Smoothing Splines
+
+```{r}
+# removed balk, IBB and GF
+gam_model <- mgcv::gam(VotePts ~ s(WAR)+
+                  s(W)+
+                  s(L)+
+                  s(ERA)+
+                  s(G)+
+                  s(CG)+
+                  factor(SHO)+ 
+                  s(IP)+
+                  s(H)+s(R)+s(ER)+s(HR)+s(BB)+s(SO)+s(HBP)+s(WP)+s(BF)+s(WHIP)+s(OppBA), method = 'REML',data = train)
+
+# predict on validation data
+predictions_gam <- predict(gam_model, newdata = validation, response = "VotePts")
+gam_mse <- mean((validation$VotePts - predictions_gam)^2)
+
+# Calculate the Root Mean Squared Error (RMSE)
+gam_rmse <- sqrt(gam_mse)
+print(gam_rmse)
+
+
+```
+
+RMSE: 30.69326
+
+Model 4: Random Forest
+
+```{r}
+set.seed(12345)
+rf_model <- randomForest(VotePts ~ ., data = train, ntree = 500,mtry = 6, importance = TRUE)
+#plot(rf_model, main = "Number of Trees Compared to MSE")
+
+# variable importance
+varImpPlot(rf_model,
+           sort = TRUE,
+           n.var = 10,
+           main = "Top 10 - Variable Importance")
+```
+
+Tuning
+
+```{r}
+set.seed(12345)
+tuneRF(x = train[,-1], y = train$VotePts, plot = TRUE, ntreeTry = 500, stepFactor = 0.5)
+```
+
+Predict with Random Forest
+ 
+```{r}
+# predict on validation data
+rf_predictions <- predict(rf_model, newdata = validation, response = "VotePts")
+rf_mse <- mean((validation$VotePts - rf_predictions)^2)
+
+# Calculate the Root Mean Squared Error (RMSE)
+rf_rmse <- sqrt(rf_mse)
+print(rf_rmse)
+
+```
+
+RMSE: 32.66821
+
+Model 5: XGBoost
+
+```{r}
+train_x <- model.matrix(VotePts ~ ., data = train)[, -1]
+train_y <- train$VotePts
+xgb_validation <- model.matrix(VotePts ~ ., data = validation)[, -1]
+
+set.seed(12345)
+xgb_model <- xgb.cv(data = train_x, label = train_y, subsample = 0.5, nrounds = 50, nfold = 10)
+
+```
+
+Tuning
+
+```{r}
+tune_grid <- expand.grid(
+  nrounds = 6,
+  eta = c(0.1, 0.15, 0.2, 0.25, 0.3),
+  max_depth = c(1:10),
+  gamma = c(0),
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = c(0.25, 0.5, 0.75, 1)
+)
+
+set.seed(12345)
+xgb_caret <- train(x = train_x, y = train_y,
+      method = "xgbTree",
+      tuneGrid = tune_grid,
+      trControl = trainControl(method = 'cv', # Using 10-fold cross-validation
+                               number = 10))
+plot(xgb_caret)
+xgb_caret$bestTune
+```
+
+```{r}
+set.seed(12345)
+xgb_model <- xgb.cv(data = train_x, label = train_y, max_depth = 2, eta = 0.3, gamma = 0, colsample_bytree = 1, 
+                    min_child_weight = 1, subsample = 0.5, nrounds = 13, nfold = 10)
+
+
+tune_grid <- expand.grid(
+  nrounds = 13,
+  eta = c(0.2, 0.25, 0.3, 0.4),
+  max_depth = c(1:10),
+  gamma = c(0),
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = c(0.25, 0.5, 0.75, 1)
+)
+set.seed(12345)
+xgb_caret <- train(x = train_x, y = train_y,
+      method = "xgbTree",
+      tuneGrid = tune_grid,
+      trControl = trainControl(method = 'cv', # Using 10-fold cross-validation
+                               number = 10))
+xgb_caret$bestTune
+
+```
+
+```{r}
+set.seed(12345)
+xgb_model <- xgb.cv(data = train_x, label = train_y, max_depth = 4, eta = 0.25, gamma = 0, colsample_bytree = 1, 
+                    min_child_weight = 1, subsample = 0.5, nrounds = 25, nfold = 10)
+
+
+tune_grid <- expand.grid(
+  nrounds = 25,
+  eta = c(0.1, 0.15, 0.2, 0.25, 0.3),
+  max_depth = c(1:10),
+  gamma = c(0),
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = c(0.25, 0.5, 0.75, 1)
+)
+set.seed(12345)
+xgb_caret <- train(x = train_x, y = train_y,
+      method = "xgbTree",
+      tuneGrid = tune_grid,
+      trControl = trainControl(method = 'cv', # Using 10-fold cross-validation
+                               number = 10))
+xgb_caret$bestTune
+
+```
+
+Predict with XGBoost
+ 
+```{r}
+ # final model
+xgb_model <- xgboost(data = train_x, label = train_y, max_depth = 5, eta = 0.1, gamma = 0, colsample_bytree = 1, 
+                    min_child_weight = 1, subsample = 0.25, nrounds = 25)
+
+# predict on validation data
+xgb_predictions <- predict(xgb_model, newdata = xgb_validation)
+xgb_mse <- mean((validation$VotePts - xgb_predictions)^2)
+
+# Calculate the RMSE
+xgb_rmse <- sqrt(xgb_mse)
+print(xgb_rmse)
+
+```
+
+RMSE: 33.43728
+
+Model 6: Neural Network
+
+```{r}
+# create scaled variable data set
+# removed balk, IBB and GF
+
+scaled_train <- train %>%
+  mutate(s_VotePts = scale(VotePts),
+         s_war = scale(WAR),
+         s_w = scale(W),
+         s_l = scale(L),
+         s_era = scale(ERA),
+         s_g = scale(G),
+         s_cg = scale(CG),
+         s_ip = scale(IP),
+         s_h = scale(H),s_r=scale(R),s_er=scale(ER),s_hr=scale(HR),s_bb=scale(BB),s_so=scale(SO),s_hbp=scale(HBP),s_wp=scale(WP),s_bf=scale(BF),s_whip=scale(WHIP),s_oppba=scale(OppBA))
+scaled_train$SHO <- as.factor(scaled_train$SHO)
+```
+
+Fit Neural Net (final model after tuning)
+
+```{r}
+
+set.seed(12345)
+nn_model <- nnet(s_VotePts ~ 
+                  s_war + 
+                  s_w + 
+                  s_l + 
+                  s_era + 
+                  s_g + 
+                  s_cg + 
+                  s_ip + 
+                  s_h +
+                  s_r + 
+                  s_er + 
+                  s_hr +
+                  s_bb +
+                  s_so +
+                  s_hbp +
+                  s_wp +
+                  s_bf +
+                  s_whip +
+                  s_oppba
+                  , data = scaled_train, size = 18, linout = TRUE)
+
+```
+
+
+Predict on standardized validation data
+
+```{r}
+scaled_validation <- validation %>%
+  mutate(s_VotePts = scale(VotePts),
+         s_war = scale(WAR),
+         s_w = scale(W),
+         s_l = scale(L),
+         s_era = scale(ERA),
+         s_g = scale(G),
+         s_cg = scale(CG),
+         s_ip = scale(IP),
+         s_h = scale(H),s_r=scale(R),s_er=scale(ER),s_hr=scale(HR),s_bb=scale(BB),s_so=scale(SO),s_hbp=scale(HBP),s_wp=scale(WP),s_bf=scale(BF),s_whip=scale(WHIP),s_oppba=scale(OppBA))
+scaled_validation$SHO <- as.factor(scaled_validation$SHO)
+mean_original <- mean(validation$VotePts)
+sd_original <- sd(validation$VotePts)
+scaled_predictions <- predict(nn_model, newdata = scaled_validation, type = "raw")
+unscaled_predictions <- scaled_predictions * sd_original + mean_original
+
+nn_mse <- mean((validation$VotePts - unscaled_predictions)^2)
+
+# Calculate the RMSE
+nn_rmse <- sqrt(nn_mse)
+print(nn_rmse)
+```
+
+RMSE: 55.74098
+
+
+Build a MLR based on my model from last year to compare
+
+```{r}
+
+linreg_model <- lm(VotePts ~ W + L + IP + H + HR + SO + WHIP + OppBA, data=train)
+
+lr_predictions <- predict(linreg_model, newdata = validation, response = "VotePts")
+lr_mse <- mean((validation$VotePts - lr_predictions)^2)
+
+# Calculate the Root Mean Squared Error (RMSE)
+lr_rmse <- sqrt(lr_mse)
+print(lr_rmse)
+
+```
+
+RMSE: 34.64083
+
+## Make Predictions
+
+Prepare new 2023 data to predict
+
+```{r}
+# import WAR data
+war_data <- read_csv("war_data.csv")
+war_data$Name <- gsub("\\*", "", war_data$Name)
+# Split the 'Name' column into First Name and Last Name
+name_split <- strsplit(as.character(war_data$Name), " ")
+
+# Rearrange the names to 'Last Name, First Name'
+war_data$Name <- sapply(name_split, function(x) paste(rev(x), collapse = ", "))
+
+# import all data
+datafull <- read_csv("2023_datafull.csv")
+# merge on Name
+data_2023 <- merge(war_data, datafull, by = 'Name')
+colnames(data_2023)[colnames(data_2023) == 'WAR?'] <- 'WAR'
+
+# extract player name
+player_names <- data_2023$Name
+original_index <- rownames(data_2023)
+# Drop player names from the original data frame
+data_2023 <- data_2023[, !(names(data_2023) %in% c("Name"))]
+```
+
+Predict using smoothing spline model
+
+```{r}
+ 
+final_predictions_gam <- predict(gam_model, newdata = data_2023)
+
+result <- data.frame(Name = player_names, Prediction = final_predictions_gam)
+rownames(result) <- original_index
+View(result)
+```
+
+
